@@ -17,6 +17,7 @@ I built this to use in Claude Custom Connector, so I can change my iCloud Calend
 ## Features
 
 - HTTP MCP server (`/mcp`) + `GET /health`
+- Optional OAuth 2.0 authorization server endpoints (`/.well-known/oauth-authorization-server`, `/authorize`, `/token`) with PKCE S256
 - **Calendar tools** (default write-capable profile):
   - `list_calendars()`
   - `list_calendars_with_events(start, end, expand_recurring=True)`
@@ -71,7 +72,16 @@ IMAP_HOST=imap.mail.me.com              # optional, default shown
 IMAP_PORT=993                            # optional, default shown
 SMTP_HOST=smtp.mail.me.com              # optional, default shown
 SMTP_PORT=587                            # optional, default shown
+IMAP_TIMEOUT=30                          # optional socket timeout seconds
+SMTP_TIMEOUT=30                          # optional socket timeout seconds
 ICLOUD_TRASH_FOLDER=Deleted Messages     # optional, iCloud trash folder name
+
+# OAuth for MCP endpoint protection (recommended for public HTTPS)
+OAUTH_CLIENT_ID=your-client-id
+OAUTH_CLIENT_SECRET=your-client-secret
+OAUTH_REDIRECT_URIS=https://client.example/callback,https://other-client/cb
+# Optional single-value alias:
+# OAUTH_REDIRECT_URI=https://client.example/callback
 ```
 
 Required: `APPLE_ID`, `ICLOUD_APP_PASSWORD`.
@@ -137,7 +147,7 @@ Each returned calendar has the same shape as `list_calendars()`.
 
 Creates a minimal **VEVENT**.
 
-- `tzid` defaults to `TZID` env if omitted; naive datetimes are assumed in that zone and stored as UTC.
+- `tzid` defaults to `TZID` env if omitted; naive datetimes are assumed in that zone.
 - `description` is optional; omit or pass `null` to skip it.
 - `location` is optional; omit or pass `null` to skip it.
 - `recurrence` (optional) describes how the event should repeat, for example:
@@ -159,7 +169,7 @@ Creates a minimal **VEVENT**.
     }
     ```
 
-- Returns the generated `uid` (random hex + `@claude-mcp`).
+- Returns the generated `uid` (random hex + `@chatgpt-mcp`).
 
 ### `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?, recurrence?, clear_recurrence=False) -> bool`
 
@@ -186,6 +196,7 @@ Deletes the first matching `uid` in a ±3-year window.
 **Date/Time Notes**
 
 - Accepts naive or `Z`/offset datetimes (`YYYY-MM-DDTHH:MM:SS`, optionally `Z` or `-04:00` etc.)
+- `end` must be strictly after `start` for create/update operations
 - New/edited events emit `DTSTART;TZID=...` and `DTEND;TZID=...` using provided `tzid` or `TZID` env
 - Updates attempt to reuse the original TZID when present
 - `LOCATION` is emitted when `location` is provided and non-empty; passing an empty string when updating an event removes the existing location.
@@ -302,7 +313,7 @@ See [DEPLOY.md](./DEPLOY.md) for:
 - ngrok (quick test)
 - VPS + Caddy/Nginx (permanent)
 
-Security: add auth (Cloudflare Access, Basic Auth proxy, IP allowlist). Do **NOT** expose this unauthenticated; it holds live calendar write access.
+Security: enable OAuth (`OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`) and keep this behind network controls (Cloudflare Access, Basic Auth proxy, IP allowlist). Do **NOT** expose this unauthenticated; it holds live calendar write access.
 You need a public HTTPS URL that forwards to your local `http://127.0.0.1:8000`.
 
 ---
@@ -311,7 +322,7 @@ You need a public HTTPS URL that forwards to your local `http://127.0.0.1:8000`.
 
 | Symptom              | Likely Cause / Fix                                                                |
 | -------------------- | --------------------------------------------------------------------------------- |
-| `401 Unauthorized`   | Wrong Apple ID or app-specific password; ensure `.env` uses **email**, not phone. |
+| `401 Unauthorized`   | Missing/expired OAuth Bearer token on `/mcp` or wrong Apple ID/app password; ensure OAuth is configured and `.env` uses Apple **email**, not phone. |
 | Empty event results  | Wrong calendar URL or time window; remember `end` is exclusive.                   |
 | Update/Delete no-ops | UID not in ±3-year scan window or different calendar than you’re querying.        |
 | Timezone drift       | Pass `tzid` explicitly (e.g., `America/New_York`) or use UTC `...Z`.              |
@@ -322,7 +333,7 @@ You need a public HTTPS URL that forwards to your local `http://127.0.0.1:8000`.
 
 - Use **app-specific passwords** and rotate as needed
 - Keep this server private (tunnel ACLs, IP allowlists, auth proxy)
-- This project rewrites minimal VEVENTs; advanced fields (attendees, alarms, recurrence exceptions) are not preserved on update
+- Enable OAuth (`OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`) before exposing `/mcp` over public HTTPS
 
 ---
 

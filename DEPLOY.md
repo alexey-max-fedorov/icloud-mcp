@@ -45,12 +45,11 @@ Health: `https://mcp.yourdomain.com/health`
 brew install ngrok/ngrok/ngrok
 ngrok config add-authtoken <YOUR_TOKEN>
 
-# In another terminal, run the MCP server with a shared secret:
-export MCP_AUTH_TOKEN="$(python - <<'PY'
-import secrets
-print(secrets.token_urlsafe(32))
-PY
-)"
+# In another terminal, run the MCP server with OAuth protection:
+export OAUTH_CLIENT_ID="your-client-id"
+export OAUTH_CLIENT_SECRET="your-client-secret"
+# Optional strict redirect allow-list (comma-separated):
+# export OAUTH_REDIRECT_URIS="https://client.example/callback"
 python server.py
 ```
 
@@ -63,14 +62,14 @@ ngrok http 8000
 Use the printed https URL:
 
 - MCP: `https://<random>.ngrok.io/mcp`
-- Health: `https://<random>.ngrok.io/health` (does **not** require the token)
+- Health: `https://<random>.ngrok.io/health`
 
-### MCP auth header
+### OAuth notes
 
-Configure your MCP client / ChatGPT custom connector to send:
-
-- Header: `X-Auth-Token`
-- Value: `<same value as MCP_AUTH_TOKEN>`
+- `/mcp` requires OAuth Bearer tokens: `Authorization: Bearer <access_token>`
+- `access_token` values are issued by this server’s `/authorize` + `/token` endpoints.
+- Redirect URIs must be `https://...` URLs, or localhost `http://...` URLs.
+- If `OAUTH_REDIRECT_URIS` (or `OAUTH_REDIRECT_URI`) is set, `redirect_uri` must exactly match one allow-listed value.
 
 ## VPS + Caddy (auto-TLS) or Nginx (manual TLS)
 
