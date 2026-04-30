@@ -1,5 +1,5 @@
 # server.py
-# iCloud CalDAV - MCP connector
+# iCloud MCP connector — Calendar (CalDAV), Mail (IMAP/SMTP), and OAuth.
 
 from __future__ import annotations
 
@@ -10,18 +10,23 @@ import secrets
 import hashlib
 import base64
 import time
+import contextlib
 import html as html_lib
 import imaplib
 import smtplib
 import re
+import ssl
 import email as _email_mod
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.header import decode_header as _decode_rfc2047
+from email.header import Header, decode_header as _decode_rfc2047
+from email.utils import parseaddr
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from urllib.parse import urlparse
+from typing import List, Dict, Iterator, Optional, Any
 from zoneinfo import ZoneInfo
 
+import icalendar
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -34,7 +39,7 @@ from caldav.lib import error as dav_error
 # Configuration / Env
 
 # Load .env that lives next to this file, regardless of CWD.
-load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=True)
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
 
 
 def _require_env(name: str, default: Optional[str] = None) -> str:
@@ -63,15 +68,43 @@ IMAP_HOST       = os.environ.get("IMAP_HOST", "imap.mail.me.com").strip()
 IMAP_PORT       = int(os.environ.get("IMAP_PORT", "993"))
 SMTP_HOST       = os.environ.get("SMTP_HOST", "smtp.mail.me.com").strip()
 SMTP_PORT       = int(os.environ.get("SMTP_PORT", "587"))
+IMAP_TIMEOUT    = float(os.environ.get("IMAP_TIMEOUT", "30"))
+SMTP_TIMEOUT    = float(os.environ.get("SMTP_TIMEOUT", "30"))
 ICLOUD_TRASH    = os.environ.get("ICLOUD_TRASH_FOLDER", "Deleted Messages")
 
 # OAuth config — if both vars are set, Bearer-token auth is enforced on /mcp
 OAUTH_CLIENT_ID     = os.environ.get("OAUTH_CLIENT_ID", "").strip()
 OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "").strip()
 OAUTH_ENABLED       = bool(OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET)
+def _load_redirect_uris() -> tuple[str, ...]:
+    raw_list = os.environ.get("OAUTH_REDIRECT_URIS", "")
+    single = os.environ.get("OAUTH_REDIRECT_URI", "").strip()
+    uris = {u.strip() for u in raw_list.split(",") if u.strip()}
+    if single:
+        uris.add(single)
+    return tuple(sorted(uris))
+
+OAUTH_REDIRECT_URIS = _load_redirect_uris()
 
 CODE_TTL  = 60           # auth codes expire in 60 seconds
 TOKEN_TTL = 86400 * 30   # access tokens live 30 days
+_PKCE_VERIFIER_RE = re.compile(r"^[A-Za-z0-9\-._~]{43,128}$")
+_LOCALHOST_REDIRECT_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_TLS_CONTEXT = ssl.create_default_context()
+
+# Validation
+# IMAP astring chars: printable ASCII, excluding the quoting char (") and escape (\).
+_MAILBOX_RE = re.compile(r'^[\x20-\x21\x23-\x5b\x5d-\x7e]+$')
+_UID_RE = re.compile(r'^\d+$')
+_HEADER_FORBIDDEN_RE = re.compile(r'[\r\n]')
+# C0 controls except TAB(0x09), LF(0x0a), CR(0x0d) — and DEL(0x7f).
+_C0_CONTROL_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+MAX_MAIL_LIMIT = 200
+MAX_MESSAGE_BYTES = 25 * 1024 * 1024
+MAX_SUBJECT_LEN = 998   # RFC 5322 §2.1.1
+MAX_RECIPIENTS = 100
+MAX_SEARCH_QUERY_LEN = 1024
 
 # In-memory OAuth state (tokens lost on restart — user re-authorizes after deploys)
 _auth_codes: dict[str, dict] = {}    # code → {client_id, redirect_uri, code_challenge, ...}
@@ -88,15 +121,45 @@ log = logging.getLogger("icloud-caldav")
 
 # OAuth helpers
 
+def _is_valid_pkce_verifier(verifier: str) -> bool:
+    """RFC 7636 code_verifier format: unreserved chars, length 43..128."""
+    return bool(_PKCE_VERIFIER_RE.fullmatch(verifier or ""))
+
+
 def _verify_pkce(verifier: str, challenge: str, method: str) -> bool:
     """Verify an OAuth 2.0 PKCE code_verifier against a stored code_challenge."""
-    if method == "S256":
-        digest = hashlib.sha256(verifier.encode()).digest()
-        expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-        return secrets.compare_digest(expected, challenge)
-    if method == "plain":
-        return secrets.compare_digest(verifier, challenge)
-    return False
+    if method != "S256" or not _is_valid_pkce_verifier(verifier):
+        return False
+    digest = hashlib.sha256(verifier.encode()).digest()
+    expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return secrets.compare_digest(expected, challenge)
+
+
+def _validate_redirect_uri(redirect_uri: str) -> tuple[bool, str]:
+    """Validate OAuth redirect URIs for safety and MCP interoperability."""
+    if not redirect_uri:
+        return False, "redirect_uri required"
+
+    parsed = urlparse(redirect_uri)
+    if not parsed.scheme or not parsed.netloc:
+        return False, "redirect_uri must be an absolute URI"
+    if parsed.fragment:
+        return False, "redirect_uri must not include a fragment"
+    if parsed.username or parsed.password:
+        return False, "redirect_uri must not include userinfo"
+
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https":
+        pass
+    elif parsed.scheme == "http" and host in _LOCALHOST_REDIRECT_HOSTS:
+        pass
+    else:
+        return False, "redirect_uri must be https or localhost http"
+
+    if OAUTH_REDIRECT_URIS and redirect_uri not in OAUTH_REDIRECT_URIS:
+        return False, "redirect_uri is not allow-listed"
+
+    return True, ""
 
 
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -121,7 +184,12 @@ class _BearerAuthMiddleware(BaseHTTPMiddleware):
             return JSONResponse(
                 {"error": "invalid_token"},
                 status_code=401,
-                headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+                headers={
+                    "WWW-Authenticate": (
+                        'Bearer realm="icloud-mcp", error="invalid_token", '
+                        'error_description="The access token expired or is invalid"'
+                    )
+                },
             )
         return await call_next(request)
 
@@ -153,6 +221,16 @@ async def authorize(request: Request):
     esc = html_lib.escape
     if request.method == "GET":
         params = dict(request.query_params)
+        client_id = params.get("client_id", "")
+        redirect_uri = params.get("redirect_uri", "")
+        if not OAUTH_ENABLED or client_id != OAUTH_CLIENT_ID:
+            return JSONResponse({"error": "invalid_client"}, status_code=400)
+        ok, reason = _validate_redirect_uri(redirect_uri)
+        if not ok:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": reason},
+                status_code=400,
+            )
         hidden = "".join(
             f'<input type="hidden" name="{esc(k)}" value="{esc(v)}">'
             for k, v in params.items()
@@ -184,9 +262,20 @@ async def authorize(request: Request):
 
     if not OAUTH_ENABLED or client_id != OAUTH_CLIENT_ID:
         return JSONResponse({"error": "invalid_client"}, status_code=400)
-    if not redirect_uri:
+    ok, reason = _validate_redirect_uri(redirect_uri)
+    if not ok:
         return JSONResponse(
-            {"error": "invalid_request", "error_description": "redirect_uri required"},
+            {"error": "invalid_request", "error_description": reason},
+            status_code=400,
+        )
+    if not code_challenge:
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "code_challenge required"},
+            status_code=400,
+        )
+    if code_challenge_method != "S256":
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "code_challenge_method must be S256"},
             status_code=400,
         )
 
@@ -237,7 +326,12 @@ async def token_endpoint(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
     if entry["redirect_uri"] != redirect_uri or entry["client_id"] != client_id:
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
-    if entry["code_challenge"] and not _verify_pkce(
+    if not _is_valid_pkce_verifier(code_verifier):
+        return JSONResponse(
+            {"error": "invalid_grant", "error_description": "invalid code_verifier"},
+            status_code=400,
+        )
+    if not _verify_pkce(
         code_verifier, entry["code_challenge"], entry["code_challenge_method"]
     ):
         return JSONResponse(
@@ -317,9 +411,12 @@ def _fmt_utc(ts: dt.datetime) -> str:
     return ts_utc.strftime("%Y%m%dT%H%M%SZ")
 
 def _ics_escape(text: str) -> str:
-    """Minimal ICS escaping for SUMMARY/DESCRIPTION."""
+    """RFC 5545 escaping for TEXT-typed properties (SUMMARY/DESCRIPTION/LOCATION)."""
+    text = _C0_CONTROL_RE.sub("", text)
     return (
         text.replace("\\", "\\\\")
+            .replace("\r\n", "\\n")
+            .replace("\r", "\\n")
             .replace("\n", "\\n")
             .replace(",", "\\,")
             .replace(";", "\\;")
@@ -384,7 +481,7 @@ def _build_vevent_ics(
         lines.append(f"RRULE:{rrule}")
 
     lines += ["END:VEVENT", "END:VCALENDAR"]
-    return "\n".join(lines)
+    return "\r\n".join(lines) + "\r\n"
 
 def _build_rrule(
     recurrence: Optional[Dict[str, Any]],
@@ -392,16 +489,25 @@ def _build_rrule(
     dtstart: Optional[dt.datetime] = None,
 ) -> Optional[str]:
     """Build an RFC5545 RRULE value from a high-level recurrence dict."""
+    if recurrence is None:
+        return None
+    if not isinstance(recurrence, dict):
+        raise ValueError("recurrence must be an object")
     if not recurrence:
         return None
 
     freq = (recurrence.get("frequency") or "").lower()
     if not freq:
-        return None
+        raise ValueError("recurrence.frequency is required")
 
     if freq == "custom":
         raw = recurrence.get("rrule")
-        return str(raw).strip() if raw else None
+        if not raw:
+            raise ValueError("recurrence.rrule is required when frequency='custom'")
+        value = str(raw).strip()
+        if not value:
+            raise ValueError("recurrence.rrule must be non-empty")
+        return value
 
     freq_map = {
         "daily": "DAILY",
@@ -410,17 +516,23 @@ def _build_rrule(
         "yearly": "YEARLY",
     }
     if freq not in freq_map:
-        return None
+        raise ValueError("Unsupported recurrence.frequency")
 
     parts: List[str] = [f"FREQ={freq_map[freq]}"]
 
     interval = recurrence.get("interval")
-    if isinstance(interval, int) and interval > 1:
-        parts.append(f"INTERVAL={interval}")
+    if interval is not None:
+        if not isinstance(interval, int) or interval < 1:
+            raise ValueError("recurrence.interval must be an integer >= 1")
+        if interval > 1:
+            parts.append(f"INTERVAL={interval}")
 
     by_weekday = recurrence.get("by_weekday") or []
     if by_weekday:
+        valid_days = {"MO", "TU", "WE", "TH", "FR", "SA", "SU"}
         days = [str(d).upper() for d in by_weekday]
+        if any(day not in valid_days for day in days):
+            raise ValueError("recurrence.by_weekday contains invalid values")
         parts.append(f"BYDAY={','.join(days)}")
     elif freq == "weekly" and dtstart is not None:
         weekday_map = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
@@ -428,31 +540,40 @@ def _build_rrule(
 
     by_monthday = recurrence.get("by_monthday") or []
     if by_monthday:
-        days = [str(int(d)) for d in by_monthday]
+        days_int: List[int] = []
+        for day in by_monthday:
+            day_int = int(day)
+            if day_int == 0 or day_int < -31 or day_int > 31:
+                raise ValueError("recurrence.by_monthday values must be in [-31..-1] or [1..31]")
+            days_int.append(day_int)
+        days = [str(day) for day in days_int]
         parts.append(f"BYMONTHDAY={','.join(days)}")
 
     end = recurrence.get("end") or {}
+    if not isinstance(end, dict):
+        raise ValueError("recurrence.end must be an object")
     end_type = (end.get("type") or "").lower()
     if end_type == "on_date":
         date_str = end.get("date")
-        if date_str:
-            try:
-                if len(date_str) == 10:
-                    y, m, d = map(int, date_str.split("-"))
-                    local_dt = dt.datetime(y, m, d, 23, 59, 59)
-                else:
-                    local_dt = dt.datetime.fromisoformat(date_str)
-                if local_dt.tzinfo is None:
-                    local_dt = local_dt.replace(tzinfo=ZoneInfo(tzid))
-                until_utc = local_dt.astimezone(dt.timezone.utc)
-                until_str = until_utc.strftime("%Y%m%dT%H%M%SZ")
-                parts.append(f"UNTIL={until_str}")
-            except Exception:
-                pass
+        if not date_str:
+            raise ValueError("recurrence.end.date is required when end.type='on_date'")
+        if len(date_str) == 10:
+            y, m, d = map(int, date_str.split("-"))
+            local_dt = dt.datetime(y, m, d, 23, 59, 59)
+        else:
+            local_dt = dt.datetime.fromisoformat(date_str)
+        if local_dt.tzinfo is None:
+            local_dt = local_dt.replace(tzinfo=ZoneInfo(tzid))
+        until_utc = local_dt.astimezone(dt.timezone.utc)
+        until_str = until_utc.strftime("%Y%m%dT%H%M%SZ")
+        parts.append(f"UNTIL={until_str}")
     elif end_type == "after_occurrences":
         count = end.get("count")
-        if isinstance(count, int) and count > 0:
-            parts.append(f"COUNT={count}")
+        if not isinstance(count, int) or count <= 0:
+            raise ValueError("recurrence.end.count must be an integer > 0")
+        parts.append(f"COUNT={count}")
+    elif end_type:
+        raise ValueError("Unsupported recurrence.end.type")
 
     return ";".join(parts) if parts else None
 
@@ -460,9 +581,101 @@ def _build_rrule(
 
 def _imap() -> imaplib.IMAP4_SSL:
     """Return a new authenticated IMAP connection (stateless — one per call)."""
-    conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+    conn = imaplib.IMAP4_SSL(
+        IMAP_HOST,
+        IMAP_PORT,
+        ssl_context=_TLS_CONTEXT,
+        timeout=IMAP_TIMEOUT,
+    )
     conn.login(APPLE_ID, APP_PW)
     return conn
+
+
+def _validate_mailbox(name: str) -> str:
+    """Validate an IMAP mailbox name and return its quoted-astring form."""
+    if not isinstance(name, str) or not name:
+        raise ValueError("mailbox name required")
+    if not _MAILBOX_RE.fullmatch(name):
+        raise ValueError("mailbox name contains invalid characters")
+    return f'"{name}"'
+
+
+def _validate_uid(uid: str) -> bytes:
+    """Validate an IMAP UID is a single positive integer; return its bytes form.
+
+    Refuses sequence sets like '1:*' or '1,2,3' to prevent bulk operations
+    against a mailbox via a single tool call.
+    """
+    if not isinstance(uid, str) or not _UID_RE.fullmatch(uid):
+        raise ValueError("uid must be a positive integer")
+    return uid.encode("ascii")
+
+
+def _clamp_limit(limit: Any) -> int:
+    """Clamp a user-supplied result limit into [1, MAX_MAIL_LIMIT]."""
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        raise ValueError("limit must be an integer")
+    return max(1, min(n, MAX_MAIL_LIMIT))
+
+
+def _validate_header_value(value: Optional[str], field_name: str, max_len: int = 998) -> str:
+    """Reject header values containing CR/LF (header injection)."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    if _HEADER_FORBIDDEN_RE.search(value):
+        raise ValueError(f"{field_name} must not contain CR or LF")
+    if len(value) > max_len:
+        raise ValueError(f"{field_name} exceeds {max_len} characters")
+    return value
+
+
+def _parse_recipient_list(value: Optional[str], field_name: str) -> List[str]:
+    """Parse a comma-separated recipient string and return validated addresses.
+
+    Rejects CR/LF anywhere in the input and any address that doesn't look
+    like a valid mailbox per RFC 5322 (basic shape).
+    """
+    if not value:
+        return []
+    if _HEADER_FORBIDDEN_RE.search(value):
+        raise ValueError(f"{field_name} must not contain CR or LF")
+    addrs: List[str] = []
+    for raw in value.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        name, addr = parseaddr(raw)
+        if not addr or "@" not in addr or addr.startswith("@") or addr.endswith("@"):
+            raise ValueError(f"invalid email address in {field_name}: {raw!r}")
+        if _HEADER_FORBIDDEN_RE.search(addr) or _HEADER_FORBIDDEN_RE.search(name):
+            raise ValueError(f"invalid characters in {field_name}")
+        addrs.append(addr)
+    if len(addrs) > MAX_RECIPIENTS:
+        raise ValueError(f"{field_name} exceeds {MAX_RECIPIENTS} recipients")
+    return addrs
+
+
+@contextlib.contextmanager
+def _imap_session(
+    mailbox: Optional[str] = None,
+    *,
+    readonly: bool = False,
+) -> Iterator[imaplib.IMAP4_SSL]:
+    """Open an IMAP session, optionally SELECT a validated mailbox, and clean up."""
+    conn = _imap()
+    try:
+        if mailbox is not None:
+            conn.select(_validate_mailbox(mailbox), readonly=readonly)
+        yield conn
+    finally:
+        try:
+            conn.logout()
+        except Exception as exc:
+            log.debug("IMAP logout failed: %s", exc)
 
 
 def _decode_header(value: str) -> str:
@@ -529,8 +742,7 @@ if MAIL_ENABLED:
     @mcp.tool()
     def list_mailboxes() -> List[Dict[str, Any]]:
         """List all iCloud Mail mailboxes (folders)."""
-        conn = _imap()
-        try:
+        with _imap_session() as conn:
             status, data = conn.list()
             if status != "OK":
                 return []
@@ -546,11 +758,6 @@ if MAIL_ENABLED:
                 name = m.group(1) if m else line.strip()
                 out.append({"name": name})
             return out
-        finally:
-            try:
-                conn.logout()
-            except Exception:
-                pass
 
     @mcp.tool()
     def list_messages(
@@ -561,10 +768,10 @@ if MAIL_ENABLED:
         """
         List recent messages in a mailbox with headers.
         Returns [{uid, subject, from, date, read}] newest-first.
+        ``limit`` is clamped to MAX_MAIL_LIMIT.
         """
-        conn = _imap()
-        try:
-            conn.select(f'"{mailbox}"', readonly=True)
+        limit = _clamp_limit(limit)
+        with _imap_session(mailbox, readonly=True) as conn:
             criteria = "UNSEEN" if unread_only else "ALL"
             status, data = conn.uid("SEARCH", None, criteria)
             if status != "OK" or not data or not data[0]:
@@ -598,22 +805,28 @@ if MAIL_ENABLED:
                     "read": "Seen" in flags,
                 })
             return out
-        finally:
-            try:
-                conn.logout()
-            except Exception:
-                pass
 
     @mcp.tool()
     def get_message(uid: str, mailbox: str = "INBOX") -> Dict[str, Any]:
         """
         Fetch a full message by UID.
         Returns {uid, subject, from, to, cc, date, body, read}.
+        Refuses messages larger than MAX_MESSAGE_BYTES.
         """
-        conn = _imap()
-        try:
-            conn.select(f'"{mailbox}"', readonly=True)
-            status, data = conn.uid("FETCH", uid.encode(), "(FLAGS RFC822)")
+        uid_bytes = _validate_uid(uid)
+        with _imap_session(mailbox, readonly=True) as conn:
+            size_status, size_data = conn.uid("FETCH", uid_bytes, "(RFC822.SIZE)")
+            if size_status != "OK" or not size_data or size_data[0] is None:
+                return {"error": f"Message UID {uid} not found in {mailbox}"}
+            size_match = re.search(rb"RFC822\.SIZE\s+(\d+)", size_data[0] if isinstance(size_data[0], bytes) else b"")
+            if size_match and int(size_match.group(1)) > MAX_MESSAGE_BYTES:
+                return {
+                    "error": (
+                        f"Message UID {uid} is {int(size_match.group(1))} bytes, "
+                        f"larger than MAX_MESSAGE_BYTES ({MAX_MESSAGE_BYTES})"
+                    )
+                }
+            status, data = conn.uid("FETCH", uid_bytes, "(FLAGS RFC822)")
             if status != "OK" or not data or data[0] is None:
                 return {"error": f"Message UID {uid} not found in {mailbox}"}
             for item in data:
@@ -635,11 +848,6 @@ if MAIL_ENABLED:
                     "read": "Seen" in flags,
                 }
             return {"error": f"Message UID {uid} not found"}
-        finally:
-            try:
-                conn.logout()
-            except Exception:
-                pass
 
     @mcp.tool()
     def search_messages(
@@ -650,11 +858,22 @@ if MAIL_ENABLED:
         """
         Search messages by text (subject + body).
         Returns [{uid, subject, from, date}] newest-first.
+        ``limit`` is clamped to MAX_MAIL_LIMIT.
         """
-        conn = _imap()
-        try:
-            conn.select(f'"{mailbox}"', readonly=True)
-            status, data = conn.uid("SEARCH", None, f'TEXT "{query}"')
+        if not isinstance(query, str) or not query:
+            raise ValueError("query is required")
+        if len(query) > MAX_SEARCH_QUERY_LEN:
+            raise ValueError(f"query exceeds {MAX_SEARCH_QUERY_LEN} characters")
+        if _HEADER_FORBIDDEN_RE.search(query):
+            raise ValueError("query must not contain CR or LF")
+        limit = _clamp_limit(limit)
+        with _imap_session(mailbox, readonly=True) as conn:
+            # Pass the query as bytes so imaplib uses an IMAP literal
+            # (length-prefixed) instead of a quoted astring — safe regardless
+            # of content.
+            status, data = conn.uid(
+                "SEARCH", "CHARSET", "UTF-8", "TEXT", query.encode("utf-8")
+            )
             if status != "OK" or not data or not data[0]:
                 return []
             uids = data[0].split()[-limit:][::-1]
@@ -683,11 +902,6 @@ if MAIL_ENABLED:
                     "date": msg.get("Date", ""),
                 })
             return out
-        finally:
-            try:
-                conn.logout()
-            except Exception:
-                pass
 
     @mcp.tool()
     def send_message(
@@ -698,30 +912,39 @@ if MAIL_ENABLED:
         bcc: Optional[str] = None,
     ) -> bool:
         """
-        Send an email via iCloud SMTP. `to` and `cc` may be comma-separated.
-        Returns True on success.
+        Send an email via iCloud SMTP. `to`, `cc`, `bcc` may be comma-separated.
+        Returns True on success. Rejects header injection in subject/recipients.
         """
+        # Header-injection hardening: validate every input that lands in a
+        # MIME header or in the SMTP envelope.
+        subject = _validate_header_value(subject, "subject", max_len=MAX_SUBJECT_LEN)
+        to_addrs = _parse_recipient_list(to, "to")
+        cc_addrs = _parse_recipient_list(cc, "cc")
+        bcc_addrs = _parse_recipient_list(bcc, "bcc")
+        if not to_addrs:
+            raise ValueError("to is required")
+        if not isinstance(body, str):
+            raise ValueError("body must be a string")
+        recipients = to_addrs + cc_addrs + bcc_addrs
+        if len(recipients) > MAX_RECIPIENTS:
+            raise ValueError(f"total recipients exceed {MAX_RECIPIENTS}")
+
         msg = MIMEMultipart()
         msg["From"] = APPLE_ID
-        msg["To"] = to
-        msg["Subject"] = subject
-        if cc:
-            msg["Cc"] = cc
+        msg["To"] = ", ".join(to_addrs)
+        msg["Subject"] = Header(subject, "utf-8")
+        if cc_addrs:
+            msg["Cc"] = ", ".join(cc_addrs)
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        recipients = [a.strip() for a in to.split(",")]
-        if cc:
-            recipients += [a.strip() for a in cc.split(",")]
-        if bcc:
-            recipients += [a.strip() for a in bcc.split(",")]
-
         try:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as conn:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as conn:
                 conn.ehlo()
-                conn.starttls()
+                conn.starttls(context=_TLS_CONTEXT)
+                conn.ehlo()
                 conn.login(APPLE_ID, APP_PW)
                 conn.sendmail(APPLE_ID, recipients, msg.as_bytes())
-            log.info("SMTP: sent message to %s", to)
+            log.info("SMTP: sent message to %d recipient(s)", len(recipients))
             return True
         except Exception as exc:
             log.error("SMTP send failed: %s", exc)
@@ -732,44 +955,51 @@ if MAIL_ENABLED:
         """
         Move a message to Trash by UID. Returns True on success.
         The trash folder name can be overridden via ICLOUD_TRASH_FOLDER env var
-        (default: "Deleted Messages").
+        (default: "Deleted Messages"). Only single positive-integer UIDs are
+        accepted — sequence sets like '1:*' are rejected.
         """
-        conn = _imap()
+        uid_bytes = _validate_uid(uid)
+        trash_quoted = _validate_mailbox(ICLOUD_TRASH)
         try:
-            conn.select(f'"{mailbox}"')
-            try:
-                conn.uid("COPY", uid.encode(), f'"{ICLOUD_TRASH}"')
-            except Exception:
-                pass  # if copy fails, still mark deleted below
-            conn.uid("STORE", uid.encode(), "+FLAGS", "\\Deleted")
-            conn.expunge()
-            return True
+            with _imap_session(mailbox) as conn:
+                copy_status, _ = conn.uid("COPY", uid_bytes, trash_quoted)
+                if copy_status != "OK":
+                    log.error("delete_message failed: could not copy UID %s to %s", uid, ICLOUD_TRASH)
+                    return False
+                store_status, _ = conn.uid("STORE", uid_bytes, "+FLAGS", "\\Deleted")
+                if store_status != "OK":
+                    log.error("delete_message failed: could not mark UID %s as deleted", uid)
+                    return False
+                expunge_status, _ = conn.expunge()
+                if expunge_status != "OK":
+                    log.error("delete_message failed: expunge failed for UID %s", uid)
+                    return False
+                return True
         except Exception as exc:
             log.error("delete_message failed: %s", exc)
             return False
-        finally:
-            try:
-                conn.logout()
-            except Exception:
-                pass
 
     @mcp.tool()
     def mark_message(uid: str, mailbox: str = "INBOX", read: bool = True) -> bool:
-        """Mark a message as read (read=True) or unread (read=False). Returns True on success."""
-        conn = _imap()
+        """Mark a message as read (read=True) or unread (read=False).
+
+        Returns True only when the IMAP server confirmed a STORE response for
+        the UID. Refuses sequence-set inputs.
+        """
+        uid_bytes = _validate_uid(uid)
         try:
-            conn.select(f'"{mailbox}"')
-            flag_op = "+FLAGS" if read else "-FLAGS"
-            status, _ = conn.uid("STORE", uid.encode(), flag_op, "\\Seen")
-            return status == "OK"
+            with _imap_session(mailbox) as conn:
+                flag_op = "+FLAGS" if read else "-FLAGS"
+                status, data = conn.uid("STORE", uid_bytes, flag_op, "\\Seen")
+                if status != "OK":
+                    return False
+                # IMAP returns [None] when no message matched the UID.
+                if not data or all(item is None for item in data):
+                    return False
+                return any(uid_bytes in item for item in data if isinstance(item, bytes))
         except Exception as exc:
             log.error("mark_message failed: %s", exc)
             return False
-        finally:
-            try:
-                conn.logout()
-            except Exception:
-                pass
 
 
 # DR profile: read-only search/fetch
@@ -939,6 +1169,8 @@ if not DR_ONLY:
 
         s = _normalize_to_tz(_parse_iso(start), tzid)
         e = _normalize_to_tz(_parse_iso(end), tzid)
+        if e <= s:
+            raise ValueError("end must be after start")
 
         cal = _resolve_calendar(calendar_name_or_url)
 
@@ -974,8 +1206,6 @@ if not DR_ONLY:
         clear_recurrence: bool = False,
     ) -> bool:
         """Update a VEVENT identified by UID."""
-        tzid = tzid or DEFAULT_TZID
-
         cal = _resolve_calendar(calendar_name_or_url)
 
         s_window, e_window = _uid_search_window()
@@ -989,57 +1219,79 @@ if not DR_ONLY:
         if target is None:
             return False
 
-        comp = target.component
-        old_summary = str(comp.get("summary", "")) if comp.get("summary") is not None else ""
-        old_desc    = str(comp.get("description", "")) if comp.get("description") is not None else ""
-        old_loc     = str(comp.get("location", "")) if comp.get("location") is not None else ""
-        old_dtstart = comp.decoded("dtstart")
-        old_dtend   = comp.decoded("dtend", default=None)
+        cal_obj = icalendar.Calendar.from_ical(target.data)
+        matching_events = [
+            component
+            for component in cal_obj.walk("VEVENT")
+            if str(component.get("uid", "") or "").strip() == uid
+        ]
+        if not matching_events:
+            return False
 
-        old_rrule_str: Optional[str] = None
-        try:
-            old_rrule_prop = comp.get("rrule")
-            if old_rrule_prop is not None:
-                if hasattr(old_rrule_prop, "to_ical"):
-                    raw = old_rrule_prop.to_ical()
-                    if isinstance(raw, bytes):
-                        raw = raw.decode()
-                    old_rrule_str = str(raw).strip()
-                else:
-                    old_rrule_str = str(old_rrule_prop).strip()
-        except Exception:
-            old_rrule_str = None
-
-        new_summary = summary if summary is not None else old_summary
-        new_desc    = description if description is not None else old_desc
-        new_loc     = location if location is not None else old_loc
-        new_start   = _parse_iso_or_default(start, old_dtstart)
-        new_end_fallback = old_dtend if old_dtend is not None else (new_start + dt.timedelta(hours=1))
-        new_end     = _parse_iso_or_default(end, new_end_fallback)
-
-        new_start = _normalize_to_tz(new_start, tzid)
-        new_end = _normalize_to_tz(new_end, tzid)
-
-        if clear_recurrence:
-            effective_rrule: Optional[str] = None
-        elif recurrence is not None:
-            effective_rrule = _build_rrule(recurrence, tzid=tzid, dtstart=new_start)
-        else:
-            effective_rrule = old_rrule_str
-
-        ics_text = _build_vevent_ics(
-            uid=uid,
-            summary=new_summary,
-            start=new_start,
-            end=new_end,
-            tzid=tzid,
-            description=new_desc,
-            location=new_loc,
-            rrule=effective_rrule,
-            include_location=new_loc is not None and new_loc != "",
+        # Prefer the master VEVENT when recurrence exceptions are present.
+        comp = next(
+            (component for component in matching_events if component.get("RECURRENCE-ID") is None),
+            matching_events[0],
         )
 
-        target.data = ics_text
+        old_summary = str(comp.get("summary", "")) if comp.get("summary") is not None else ""
+        old_desc = str(comp.get("description", "")) if comp.get("description") is not None else ""
+        old_loc = str(comp.get("location", "")) if comp.get("location") is not None else ""
+        old_dtstart = comp.decoded("dtstart")
+        old_dtend = comp.decoded("dtend", default=None)
+
+        dtstart_prop = comp.get("dtstart")
+        existing_tzid = None
+        if dtstart_prop is not None and hasattr(dtstart_prop, "params"):
+            existing_tzid = dtstart_prop.params.get("TZID")
+            if existing_tzid is not None:
+                existing_tzid = str(existing_tzid)
+        effective_tzid = tzid or existing_tzid or DEFAULT_TZID
+
+        new_summary = summary if summary is not None else old_summary
+        new_desc = description if description is not None else old_desc
+        new_loc = location if location is not None else old_loc
+        new_start = _parse_iso_or_default(start, old_dtstart)
+        new_end_fallback = old_dtend if old_dtend is not None else (new_start + dt.timedelta(hours=1))
+        new_end = _parse_iso_or_default(end, new_end_fallback)
+
+        new_start = _normalize_to_tz(new_start, effective_tzid)
+        new_end = _normalize_to_tz(new_end, effective_tzid)
+        if new_end <= new_start:
+            raise ValueError("end must be after start")
+
+        # Strip tzinfo so icalendar serializes as floating local datetime, then
+        # attach TZID via params — otherwise icalendar may emit a UTC value (Z)
+        # AND a TZID parameter, which is invalid per RFC 5545 §3.3.5.
+        local_start = new_start.astimezone(ZoneInfo(effective_tzid)).replace(tzinfo=None)
+        local_end = new_end.astimezone(ZoneInfo(effective_tzid)).replace(tzinfo=None)
+
+        comp["SUMMARY"] = icalendar.vText(new_summary)
+        comp.pop("DTSTART", None)
+        comp.pop("DTEND", None)
+        comp.add("DTSTART", local_start, parameters={"TZID": effective_tzid})
+        comp.add("DTEND", local_end, parameters={"TZID": effective_tzid})
+
+        if new_desc != "":
+            comp["DESCRIPTION"] = icalendar.vText(new_desc)
+        else:
+            comp.pop("DESCRIPTION", None)
+
+        if new_loc != "":
+            comp["LOCATION"] = icalendar.vText(new_loc)
+        else:
+            comp.pop("LOCATION", None)
+
+        if clear_recurrence:
+            comp.pop("RRULE", None)
+        elif recurrence is not None:
+            effective_rrule = _build_rrule(recurrence, tzid=effective_tzid, dtstart=new_start)
+            if effective_rrule:
+                comp["RRULE"] = icalendar.vRecur.from_ical(effective_rrule)
+            else:
+                comp.pop("RRULE", None)
+
+        target.data = cal_obj.to_ical().decode()
         target.save()
         return True
 
@@ -1079,6 +1331,10 @@ if __name__ == "__main__":
     if OAUTH_ENABLED:
         app.add_middleware(_BearerAuthMiddleware)
         log.info("OAuth enabled — /mcp requires Bearer token (client_id=%r)", OAUTH_CLIENT_ID)
+        if OAUTH_REDIRECT_URIS:
+            log.info("OAuth redirect allow-list configured (%d URI(s))", len(OAUTH_REDIRECT_URIS))
+        else:
+            log.warning("OAuth redirect allow-list is empty. Set OAUTH_REDIRECT_URIS for stricter redirect control.")
     else:
         log.warning("OAuth is DISABLED — /mcp is publicly accessible. Set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET to enable auth.")
 
